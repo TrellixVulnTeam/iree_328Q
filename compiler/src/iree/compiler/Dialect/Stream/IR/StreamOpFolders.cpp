@@ -2341,6 +2341,74 @@ void TimepointJoinOp::getCanonicalizationPatterns(RewritePatternSet &results,
 }
 
 //===----------------------------------------------------------------------===//
+// stream.timepoint.signal
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Walks up the tied op SSA def chain to find a stream.timepoint.await op that
+// produces the resource. Returns nullptr if no await op is found or local
+// analysis cannot determine the source (spans across a branch, etc).
+static std::pair<IREE::Stream::TimepointAwaitOp, Value> findSourceAwaitOp(
+    Value resource) {
+  Value baseResource = resource;
+  while (auto definingOp = dyn_cast_or_null<IREE::Util::TiedOpInterface>(
+             baseResource.getDefiningOp())) {
+    if (auto awaitOp = dyn_cast<IREE::Stream::TimepointAwaitOp>(
+            baseResource.getDefiningOp())) {
+      return {awaitOp, baseResource};
+    }
+    auto tiedValue = definingOp.getTiedResultOperand(baseResource);
+    if (!tiedValue) break;
+    baseResource = tiedValue;
+  }
+  return {nullptr, nullptr};
+}
+
+// Tries to find awaits that feed into signals and then chains execution by
+// propagating the original timepoint forward.
+//
+// Example:
+//  %r0a = stream.timepoint.await %t0 => %source
+//  %r0b, %t1 = stream.timepoint.signal %r0a
+// ->
+//  %r0b = %source
+//  %t1 = %t0
+struct ChainTimepoints : public OpRewritePattern<TimepointSignalOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(TimepointSignalOp signalOp,
+                                PatternRewriter &rewriter) const override {
+    // Try to find an await op. This may traverse through any number of tied ops
+    // along the way.
+    auto [awaitOp, baseResource] = findSourceAwaitOp(signalOp.getResource());
+    if (!awaitOp) return failure();
+
+    // TODO(benvanik): move this to a pass that can do IPO. Local analysis is
+    // insufficient for this. For now we conservatively ignore any case where
+    // the await does not feed directly into the signal.
+    if (baseResource != signalOp.getResource()) {
+      return rewriter.notifyMatchFailure(
+          signalOp, "ops exist between await and signal, not yet matching");
+    }
+
+    // Rewrite such that consumers of the signal op wait on the prior
+    // timepoint.
+    rewriter.replaceOp(signalOp, {
+                                     awaitOp.getTiedResultOperand(baseResource),
+                                     awaitOp.getAwaitTimepoint(),
+                                 });
+    return success();
+  }
+};
+
+}  // namespace
+
+void TimepointSignalOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                    MLIRContext *context) {
+  results.insert<ChainTimepoints>(context);
+}
+
+//===----------------------------------------------------------------------===//
 // stream.timepoint.await
 //===----------------------------------------------------------------------===//
 
@@ -2461,6 +2529,16 @@ struct SinkSubviewsAcrossAwaits : public OpRewritePattern<TimepointAwaitOp> {
   }
 };
 
+// Returns true if all operands of |op| are defined before |insertionPoint| in
+// the containing block.
+static bool areAllOperandsDefinedBy(Operation *op, Operation *insertionPoint,
+                                    DominanceInfo &dominanceInfo) {
+  for (auto operand : op->getOperands()) {
+    if (!dominanceInfo.dominates(operand, insertionPoint)) return false;
+  }
+  return true;
+}
+
 // Finds timepoint awaits on the same timepoint within the same domination
 // paths and groups them together.
 //
@@ -2478,17 +2556,14 @@ struct GroupAwaitsByTimepoint : public OpRewritePattern<TimepointAwaitOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(TimepointAwaitOp op,
                                 PatternRewriter &rewriter) const override {
+    DominanceInfo dominanceInfo(op->getParentOp());
     SmallVector<TimepointAwaitOp> coveredOps;
     for (auto &use : op.getAwaitTimepoint().getUses()) {
       // TODO(benvanik): make this handle joins/ties; today we get blocked
       // there. We rely on other canonicalizers to sink things such that
       // (hopefully) we get them directly accessible here.
       if (use.getOwner() == op) continue;
-      if (use.getOwner()->getBlock() != op->getBlock() ||
-          use.getOwner()->isBeforeInBlock(op)) {
-        // TODO(benvanik): allow dominated blocks.
-        continue;
-      }
+      if (dominanceInfo.dominates(use.getOwner(), op)) continue;
       auto awaitOp = dyn_cast<TimepointAwaitOp>(use.getOwner());
       if (!awaitOp ||
           !AffinityAttr::areCompatible(
@@ -2497,6 +2572,11 @@ struct GroupAwaitsByTimepoint : public OpRewritePattern<TimepointAwaitOp> {
         // Can't combine if the affinities differ as the wait semantics are
         // load-bearing. Probably. They really shouldn't be.
         // TODO(benvanik): remove affinity from stream.timepoint.await.
+        continue;
+      }
+      // Ensure all dependencies of the await op are available.
+      if (!areAllOperandsDefinedBy(awaitOp, op, dominanceInfo)) {
+        // One or more operands is defined after op so we can't merge.
         continue;
       }
       coveredOps.push_back(awaitOp);
